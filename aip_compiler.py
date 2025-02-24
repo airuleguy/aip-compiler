@@ -20,6 +20,7 @@ os.makedirs(output_dir, exist_ok=True)
 MIN_FILE_SIZE = 1024  # Minimum file size in bytes (1KB)
 MAX_WORKERS = 10  # Number of parallel download workers
 DATE_LIMIT_YEARS = 2  # Limit to 2 years back
+MAX_CONSECUTIVE_404S = 5  # Tolerance for gaps
 
 # URL templates for iterable groups
 url_templates = {
@@ -40,13 +41,26 @@ headers = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
 }
 
-# Function to check if a URL exists (returns True if 200, False if 404 or error)
-def url_exists(url):
-    try:
-        response = requests.head(url, headers=headers, timeout=5)
-        return response.status_code == 200
-    except requests.exceptions.RequestException:
-        return False
+# Function to check if a URL exists (explicit 404 check with retries)
+def url_exists(url, max_retries=3):
+    for attempt in range(max_retries):
+        try:
+            response = requests.head(url, headers=headers, timeout=5)
+            status = response.status_code
+            logging.info(f"Checked {url}: HTTP {status}")
+            if status == 200:
+                return True
+            elif status == 404:
+                return False
+            # Other statuses (e.g., 500, 503) trigger retry
+            logging.warning(f"Unexpected status {status} for {url}, attempt {attempt + 1}/{max_retries}")
+        except requests.exceptions.RequestException as e:
+            logging.warning(f"Network error for {url}, attempt {attempt + 1}/{max_retries}: {e}")
+            if attempt + 1 == max_retries:
+                logging.error(f"Exhausted retries for {url}, treating as unavailable but not 404")
+                return True  # Treat as "exists" to keep going, avoid false 404
+            time.sleep(2 ** attempt)  # Exponential backoff
+    return True  # Default to True after retries to avoid false 404
 
 # Function to find the most recent valid date for a group
 def find_valid_date_for_group(test_url_template, is_iterable=True):
@@ -108,10 +122,10 @@ def download_pdf(url, filename, max_retries=3):
                 print(f"Failed to download {url} after {max_retries} attempts: {e}")
                 return False
             logging.warning(f"Attempt {attempt + 1} failed for {url}, retrying...")
-            time.sleep(2 ** attempt)  # Exponential backoff
+            time.sleep(2 ** attempt)
     return False
 
-# Function to download PDFs for an iterable group, stopping after two consecutive 404s
+# Function to download PDFs for an iterable group, stopping after MAX_CONSECUTIVE_404S
 def download_iterable_pdfs(group_name, url_template, date):
     downloaded_files = []
     iter_num = 0
@@ -119,14 +133,14 @@ def download_iterable_pdfs(group_name, url_template, date):
     tasks = []
     
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        while consecutive_404s < 2:
+        while consecutive_404s < MAX_CONSECUTIVE_404S:
             url = url_template.format(date=date, iter=iter_num)
             filename = os.path.join(output_dir, f"{group_name}_{iter_num}.pdf")
             
             if not url_exists(url):
                 consecutive_404s += 1
-                logging.info(f"{group_name}: 404 at iter={iter_num} ({consecutive_404s}/2 consecutive)")
-                print(f"{group_name}: 404 at iter={iter_num} ({consecutive_404s}/2 consecutive)")
+                logging.info(f"{group_name}: 404 at iter={iter_num} ({consecutive_404s}/{MAX_CONSECUTIVE_404S} consecutive)")
+                print(f"{group_name}: 404 at iter={iter_num} ({consecutive_404s}/{MAX_CONSECUTIVE_404S} consecutive)")
             else:
                 consecutive_404s = 0
                 future = executor.submit(download_pdf, url, filename)
@@ -135,8 +149,8 @@ def download_iterable_pdfs(group_name, url_template, date):
             iter_num += 1
             time.sleep(0.0)
         
-        logging.info(f"{group_name}: Stopped at iter={iter_num} (2 consecutive 404s)")
-        print(f"{group_name}: Stopped at iter={iter_num} (2 consecutive 404s)")
+        logging.info(f"{group_name}: Stopped at iter={iter_num} ({MAX_CONSECUTIVE_404S} consecutive 404s)")
+        print(f"{group_name}: Stopped at iter={iter_num} ({MAX_CONSECUTIVE_404S} consecutive 404s)")
         
         for future, filename in tasks:
             success = future.result()
